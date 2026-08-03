@@ -43,11 +43,15 @@ _Static_assert(FF_MIN_SS == 512 && FF_MAX_SS == 512, "sector cache assumes 512-b
 #define FAT_SECTOR_CACHE_SIZE  8
 
 typedef struct {
+	/* Kept first and 8-byte aligned: write-back hands this buffer straight to
+	   disk_write(), and the cart DMA path bounces any source that is not 8-byte
+	   aligned through a slow per-sector CPU copy. The attribute also pads the
+	   struct to a multiple of 8, so every slot in the array stays aligned. */
+	uint8_t  data[512] __attribute__((aligned(8)));
 	bool     valid;
 	bool     dirty;
 	LBA_t    sector;
 	uint32_t tick;
-	uint8_t  data[512];
 } fat_sector_cache_slot_t;
 
 typedef struct {
