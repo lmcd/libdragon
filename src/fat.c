@@ -408,6 +408,13 @@ static int __fat_read(void *file, uint8_t *ptr, int len)
 static int __fat_write(void *file, uint8_t *ptr, int len)
 {
 	UINT written;
+	/* A buffer outside RDRAM can only be handed to disk_write, never dereferenced.
+	   f_write merges sub-sector data through the CPU, which requires both the
+	   current file offset and the length to be whole sectors. */
+	assertf(PhysicalAddr(ptr) < 0x00800000 ||
+		((f_tell((FIL*)file) % FF_MAX_SS) == 0 && (len % FF_MAX_SS) == 0),
+		"FAT: write from non-RDRAM buffer must be sector-aligned (offset=%llu, len=%d)",
+		(uint64_t)f_tell((FIL*)file), len);
 	FRESULT res = f_write(file, ptr, len, &written);
 	if (res != FR_OK) {
 		__fresult_set_errno(res);
