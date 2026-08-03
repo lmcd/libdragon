@@ -326,6 +326,7 @@ typedef enum {
 /*--------------------------------------------------------------*/
 
 FRESULT f_open (FIL* fp, const TCHAR* path, BYTE mode);				/* Open or create a file */
+FRESULT f_open_in_dir (DIR* dp, FIL* fp, const TCHAR* name, BYTE mode, BYTE opt);	/* LOCAL PATCH (libdragon): open or create a file in an opened directory */
 FRESULT f_close (FIL* fp);											/* Close an open file object */
 FRESULT f_read (FIL* fp, void* buff, UINT btr, UINT* br);			/* Read data from the file */
 FRESULT f_write (FIL* fp, const void* buff, UINT btw, UINT* bw);	/* Write data to the file */
@@ -421,6 +422,11 @@ void ff_mutex_give (int vol);		/* Unlock sync object */
 #define	FA_CREATE_ALWAYS	0x08
 #define	FA_OPEN_ALWAYS		0x10
 #define	FA_OPEN_APPEND		0x30
+
+/* LOCAL PATCH (libdragon): option flags (5th argument of f_open_in_dir). Kept
+/  separate from the mode flags above, whose 8 bits are fully used -- 0x40/0x80 are
+/  FA_MODIFIED/FA_DIRTY, set internally on the same field. */
+#define	FF_OPEN_NO_LOOKUP	0x01	/* Skip the existence check: the caller guarantees the name is not in the directory */
 
 /* Fast seek controls (2nd argument of f_lseek function) */
 #define CREATE_LINKMAP	((FSIZE_t)0 - 1)

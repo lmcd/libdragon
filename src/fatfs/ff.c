@@ -3830,6 +3830,186 @@ FRESULT f_mount (
 /* API: Open or Create a File                                            */
 /*-----------------------------------------------------------------------*/
 
+/* LOCAL PATCH (libdragon): the body of f_open() below the name lookup, shared by
+/  f_open() and f_open_in_dir(). On entry dj must be a directory object whose name
+/  lookup has already been done, and res must be its result (FR_OK when the entry
+/  was found, FR_NO_FILE when it was not). The caller owns NAMEBUFF, which must still
+/  be live, and does the LEAVE_FF(). */
+
+static FRESULT open_from_dir (
+	DIR* dj,			/* Directory object with the name lookup already done */
+	FIL* fp,			/* Pointer to the blank file object */
+	BYTE mode,			/* Access mode and open mode flags */
+	FRESULT res			/* Result of the name lookup */
+)
+{
+	FATFS *fs = dj->obj.fs;
+
+
+	fp->obj.fs = fs;	/* init_alloc_info() and the tail below read this */
+#if !FF_FS_READONLY	/* Read/Write configuration */
+	if (res == FR_OK) {
+		if (dj->fn[NSFLAG] & NS_NONAME) {	/* Origin directory itself? */
+			res = FR_INVALID_NAME;
+		}
+#if FF_FS_LOCK
+		else {
+			res = chk_share(dj, (mode & ~FA_READ) ? 1 : 0);	/* Check if the file can be used */
+		}
+#endif
+	}
+	/* Create or Open a file */
+	if (mode & (FA_CREATE_ALWAYS | FA_OPEN_ALWAYS | FA_CREATE_NEW)) {
+		if (res != FR_OK) {					/* No file, create new */
+			if (res == FR_NO_FILE) {		/* There is no file to open, create a new entry */
+#if FF_FS_LOCK
+				res = enq_share() ? dir_register(dj) : FR_TOO_MANY_OPEN_FILES;
+#else
+				res = dir_register(dj);
+#endif
+			}
+			mode |= FA_CREATE_ALWAYS;		/* File is created */
+		}
+		else {								/* An object with the same name is already existing */
+			if (mode & FA_CREATE_NEW) {
+				res = FR_EXIST;				/* Cannot create as new file */
+			} else {
+				if (dj->obj.attr & (AM_RDO | AM_DIR)) res = FR_DENIED;	/* Cannot overwrite it (R/O or DIR) */
+			}
+		}
+		if (res == FR_OK && (mode & FA_CREATE_ALWAYS)) {	/* Truncate the file if overwrite mode */
+			DWORD tm = GET_FATTIME();
+#if FF_FS_EXFAT
+			if (fs->fs_type == FS_EXFAT) {
+				/* Get current allocation info */
+				init_alloc_info(&fp->obj, 0);
+				/* Set exFAT directory entry block initial state */
+				memset(fs->dirbuf + 2, 0, 30);	/* Clear 85 entry except for NumSec */
+				memset(fs->dirbuf + 38, 0, 26);	/* Clear C0 entry except for NumName and NameHash */
+				fs->dirbuf[XDIR_Attr] = AM_ARC;
+				st_32(fs->dirbuf + XDIR_CrtTime, tm);	/* Set created time */
+				st_32(fs->dirbuf + XDIR_ModTime, tm);	/* Set modified time (tmp setting) */
+				fs->dirbuf[XDIR_GenFlags] = 1;
+				res = store_xdir(dj);
+				if (res == FR_OK && fp->obj.sclust != 0) {	/* Remove the cluster chain if exist */
+					res = remove_chain(&fp->obj, fp->obj.sclust, 0);
+					fs->last_clst = fp->obj.sclust - 1;		/* Reuse the cluster hole */
+				}
+			} else
+#endif
+			{
+				DWORD cl;
+				/* Set FAT directory entry initial state */
+				st_32(dj->dir + DIR_CrtTime, tm);	/* Set created time */
+				st_32(dj->dir + DIR_ModTime, tm);	/* Set modified time (tmp setting) */
+				cl = ld_clust(fs, dj->dir);			/* Get current cluster chain */
+				dj->dir[DIR_Attr] = AM_ARC;			/* Reset attribute */
+				st_clust(fs, dj->dir, 0);			/* Reset file allocation info */
+				st_32(dj->dir + DIR_FileSize, 0);
+				fs->wflag = 1;
+				if (cl != 0) {						/* Remove the cluster chain if exist */
+					LBA_t sc = fs->winsect;
+
+					res = remove_chain(&dj->obj, cl, 0);
+					if (res == FR_OK) {
+						res = move_window(fs, sc);
+						fs->last_clst = cl - 1;		/* Reuse the cluster hole */
+					}
+				}
+			}
+		}
+	}
+	else {	/* Open an existing file */
+		if (res == FR_OK) {					/* Is the object exsiting? */
+			if (dj->obj.attr & AM_DIR) {		/* File open against a directory */
+				res = FR_NO_FILE;
+			} else {
+				if ((mode & FA_WRITE) && (dj->obj.attr & AM_RDO)) { /* Write mode open against R/O file */
+					res = FR_DENIED;
+				}
+			}
+		}
+	}
+	if (res == FR_OK) {
+		if (mode & FA_CREATE_ALWAYS) mode |= FA_MODIFIED;	/* Set file change flag if created or overwritten */
+		fp->dir_sect = fs->winsect;			/* Pointer to the directory entry */
+		fp->dir_ptr = dj->dir;
+#if FF_FS_LOCK
+		fp->obj.lockid = inc_share(dj, (mode & ~FA_READ) ? 1 : 0);	/* Lock the file for this session */
+		if (fp->obj.lockid == 0) res = FR_INT_ERR;
+#endif
+	}
+
+#else	/* R/O configuration */
+	if (res == FR_OK) {
+		if (dj->fn[NSFLAG] & NS_NONAME) {	/* Is it origin directory itself? */
+			res = FR_INVALID_NAME;
+		} else {
+			if (dj->obj.attr & AM_DIR) {		/* Is it a directory? */
+				res = FR_NO_FILE;
+			}
+		}
+	}
+#endif
+
+	if (res == FR_OK) {
+#if FF_FS_EXFAT
+		if (fs->fs_type == FS_EXFAT) {
+			init_alloc_info(&fp->obj, dj);
+		} else
+#endif
+		{
+			fp->obj.sclust = ld_clust(fs, dj->dir);					/* Get object allocation info */
+			fp->obj.objsize = ld_32(dj->dir + DIR_FileSize);
+		}
+#if FF_USE_FASTSEEK
+		fp->cltbl = 0;		/* Disable fast seek mode */
+#endif
+		fp->obj.id = fs->id;	/* Set current volume mount ID */
+		fp->flag = mode;	/* Set file access mode */
+		fp->err = 0;		/* Clear error flag */
+		fp->sect = 0;		/* Invalidate current data sector */
+		fp->fptr = 0;		/* Set file pointer top of the file */
+#if !FF_FS_READONLY
+#if !FF_FS_TINY
+		memset(fp->buf, 0, sizeof fp->buf);	/* Clear sector buffer */
+#endif
+		if ((mode & FA_SEEKEND) && fp->obj.objsize > 0) {	/* Seek to end of file if FA_OPEN_APPEND is specified */
+			DWORD bcs, clst;
+			FSIZE_t ofs;
+
+			fp->fptr = fp->obj.objsize;			/* Offset to seek */
+			bcs = (DWORD)fs->csize * SS(fs);	/* Cluster size in byte */
+			clst = fp->obj.sclust;				/* Follow the cluster chain */
+			for (ofs = fp->obj.objsize; res == FR_OK && ofs > bcs; ofs -= bcs) {
+				clst = get_fat(&fp->obj, clst);
+				if (clst <= 1) res = FR_INT_ERR;
+				if (clst == 0xFFFFFFFF) res = FR_DISK_ERR;
+			}
+			fp->clust = clst;
+			if (res == FR_OK && ofs % SS(fs)) {	/* Fill sector buffer if not on the sector boundary */
+				LBA_t sec = clst2sect(fs, clst);
+
+				if (sec == 0) {
+					res = FR_INT_ERR;
+				} else {
+					fp->sect = sec + (DWORD)(ofs / SS(fs));
+#if !FF_FS_TINY
+					if (disk_read(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) res = FR_DISK_ERR;
+#endif
+				}
+			}
+#if FF_FS_LOCK
+			if (res != FR_OK) dec_share(fp->obj.lockid); /* Decrement file open counter if seek failed */
+#endif
+		}
+#endif
+	}
+
+	return res;
+}
+
+
 FRESULT f_open (
 	FIL* fp,			/* Pointer to the blank file object */
 	const TCHAR* path,	/* Pointer to the file name */
@@ -3853,166 +4033,82 @@ FRESULT f_open (
 		dj.obj.fs = fs;
 		INIT_NAMEBUFF(fs);
 		res = follow_path(&dj, path);	/* Follow the file path */
-#if !FF_FS_READONLY	/* Read/Write configuration */
-		if (res == FR_OK) {
-			if (dj.fn[NSFLAG] & NS_NONAME) {	/* Origin directory itself? */
-				res = FR_INVALID_NAME;
-			}
-#if FF_FS_LOCK
-			else {
-				res = chk_share(&dj, (mode & ~FA_READ) ? 1 : 0);	/* Check if the file can be used */
-			}
-#endif
-		}
-		/* Create or Open a file */
-		if (mode & (FA_CREATE_ALWAYS | FA_OPEN_ALWAYS | FA_CREATE_NEW)) {
-			if (res != FR_OK) {					/* No file, create new */
-				if (res == FR_NO_FILE) {		/* There is no file to open, create a new entry */
-#if FF_FS_LOCK
-					res = enq_share() ? dir_register(&dj) : FR_TOO_MANY_OPEN_FILES;
-#else
-					res = dir_register(&dj);
-#endif
-				}
-				mode |= FA_CREATE_ALWAYS;		/* File is created */
-			}
-			else {								/* An object with the same name is already existing */
-				if (mode & FA_CREATE_NEW) {
-					res = FR_EXIST;				/* Cannot create as new file */
-				} else {
-					if (dj.obj.attr & (AM_RDO | AM_DIR)) res = FR_DENIED;	/* Cannot overwrite it (R/O or DIR) */
-				}
-			}
-			if (res == FR_OK && (mode & FA_CREATE_ALWAYS)) {	/* Truncate the file if overwrite mode */
-				DWORD tm = GET_FATTIME();
-#if FF_FS_EXFAT
-				if (fs->fs_type == FS_EXFAT) {
-					/* Get current allocation info */
-					init_alloc_info(&fp->obj, 0);
-					/* Set exFAT directory entry block initial state */
-					memset(fs->dirbuf + 2, 0, 30);	/* Clear 85 entry except for NumSec */
-					memset(fs->dirbuf + 38, 0, 26);	/* Clear C0 entry except for NumName and NameHash */
-					fs->dirbuf[XDIR_Attr] = AM_ARC;
-					st_32(fs->dirbuf + XDIR_CrtTime, tm);	/* Set created time */
-					st_32(fs->dirbuf + XDIR_ModTime, tm);	/* Set modified time (tmp setting) */
-					fs->dirbuf[XDIR_GenFlags] = 1;
-					res = store_xdir(&dj);
-					if (res == FR_OK && fp->obj.sclust != 0) {	/* Remove the cluster chain if exist */
-						res = remove_chain(&fp->obj, fp->obj.sclust, 0);
-						fs->last_clst = fp->obj.sclust - 1;		/* Reuse the cluster hole */
-					}
-				} else
-#endif
-				{
-					DWORD cl;
-					/* Set FAT directory entry initial state */
-					st_32(dj.dir + DIR_CrtTime, tm);	/* Set created time */
-					st_32(dj.dir + DIR_ModTime, tm);	/* Set modified time (tmp setting) */
-					cl = ld_clust(fs, dj.dir);			/* Get current cluster chain */
-					dj.dir[DIR_Attr] = AM_ARC;			/* Reset attribute */
-					st_clust(fs, dj.dir, 0);			/* Reset file allocation info */
-					st_32(dj.dir + DIR_FileSize, 0);
-					fs->wflag = 1;
-					if (cl != 0) {						/* Remove the cluster chain if exist */
-						LBA_t sc = fs->winsect;
-
-						res = remove_chain(&dj.obj, cl, 0);
-						if (res == FR_OK) {
-							res = move_window(fs, sc);
-							fs->last_clst = cl - 1;		/* Reuse the cluster hole */
-						}
-					}
-				}
-			}
-		}
-		else {	/* Open an existing file */
-			if (res == FR_OK) {					/* Is the object exsiting? */
-				if (dj.obj.attr & AM_DIR) {		/* File open against a directory */
-					res = FR_NO_FILE;
-				} else {
-					if ((mode & FA_WRITE) && (dj.obj.attr & AM_RDO)) { /* Write mode open against R/O file */
-						res = FR_DENIED;
-					}
-				}
-			}
-		}
-		if (res == FR_OK) {
-			if (mode & FA_CREATE_ALWAYS) mode |= FA_MODIFIED;	/* Set file change flag if created or overwritten */
-			fp->dir_sect = fs->winsect;			/* Pointer to the directory entry */
-			fp->dir_ptr = dj.dir;
-#if FF_FS_LOCK
-			fp->obj.lockid = inc_share(&dj, (mode & ~FA_READ) ? 1 : 0);	/* Lock the file for this session */
-			if (fp->obj.lockid == 0) res = FR_INT_ERR;
-#endif
-		}
-
-#else	/* R/O configuration */
-		if (res == FR_OK) {
-			if (dj.fn[NSFLAG] & NS_NONAME) {	/* Is it origin directory itself? */
-				res = FR_INVALID_NAME;
-			} else {
-				if (dj.obj.attr & AM_DIR) {		/* Is it a directory? */
-					res = FR_NO_FILE;
-				}
-			}
-		}
-#endif
-
-		if (res == FR_OK) {
-#if FF_FS_EXFAT
-			if (fs->fs_type == FS_EXFAT) {
-				init_alloc_info(&fp->obj, &dj);
-			} else
-#endif
-			{
-				fp->obj.sclust = ld_clust(fs, dj.dir);					/* Get object allocation info */
-				fp->obj.objsize = ld_32(dj.dir + DIR_FileSize);
-			}
-#if FF_USE_FASTSEEK
-			fp->cltbl = 0;		/* Disable fast seek mode */
-#endif
-			fp->obj.id = fs->id;	/* Set current volume mount ID */
-			fp->flag = mode;	/* Set file access mode */
-			fp->err = 0;		/* Clear error flag */
-			fp->sect = 0;		/* Invalidate current data sector */
-			fp->fptr = 0;		/* Set file pointer top of the file */
-#if !FF_FS_READONLY
-#if !FF_FS_TINY
-			memset(fp->buf, 0, sizeof fp->buf);	/* Clear sector buffer */
-#endif
-			if ((mode & FA_SEEKEND) && fp->obj.objsize > 0) {	/* Seek to end of file if FA_OPEN_APPEND is specified */
-				DWORD bcs, clst;
-				FSIZE_t ofs;
-
-				fp->fptr = fp->obj.objsize;			/* Offset to seek */
-				bcs = (DWORD)fs->csize * SS(fs);	/* Cluster size in byte */
-				clst = fp->obj.sclust;				/* Follow the cluster chain */
-				for (ofs = fp->obj.objsize; res == FR_OK && ofs > bcs; ofs -= bcs) {
-					clst = get_fat(&fp->obj, clst);
-					if (clst <= 1) res = FR_INT_ERR;
-					if (clst == 0xFFFFFFFF) res = FR_DISK_ERR;
-				}
-				fp->clust = clst;
-				if (res == FR_OK && ofs % SS(fs)) {	/* Fill sector buffer if not on the sector boundary */
-					LBA_t sec = clst2sect(fs, clst);
-
-					if (sec == 0) {
-						res = FR_INT_ERR;
-					} else {
-						fp->sect = sec + (DWORD)(ofs / SS(fs));
-#if !FF_FS_TINY
-						if (disk_read(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) res = FR_DISK_ERR;
-#endif
-					}
-				}
-#if FF_FS_LOCK
-				if (res != FR_OK) dec_share(fp->obj.lockid); /* Decrement file open counter if seek failed */
-#endif
-			}
-#endif
-		}
-
+		res = open_from_dir(&dj, fp, mode, res);	/* LOCAL PATCH (libdragon): shared with f_open_in_dir() */
 		FREE_NAMEBUFF();
+	}
+
+	if (res != FR_OK) fp->obj.fs = 0;	/* Invalidate file object on error */
+
+	LEAVE_FF(fs, res);
+}
+
+
+
+
+/*-----------------------------------------------------------------------*/
+/* API: Open or Create a File in an Already-Opened Directory              */
+/*-----------------------------------------------------------------------*/
+
+/* LOCAL PATCH (libdragon): f_open() resolves every component of the path on every
+/  call, so opening N files in one directory walks that directory (and its parents)
+/  N times. This opens `name` -- a single path component, no separators -- directly
+/  inside the directory `dp` opened by f_opendir(), leaving only the final dir_find()
+/  in that directory. `dp` is used for its identity and start cluster only; its read
+/  position is untouched, so it can still be walked with f_readdir(). Modes and
+/  semantics are otherwise identical to f_open().
+/
+/  With FF_OPEN_NO_LOOKUP in `opt` the dir_find() above is skipped too, so a create
+/  does no scanning of its own. Note dir_register() still calls dir_alloc() to find
+/  free slots, and for a name that does not fit 8.3 it runs its own dir_find() loop
+/  to resolve numbered-SFN collisions -- so the flag only removes all scanning for
+/  8.3-compatible names. */
+
+FRESULT f_open_in_dir (
+	DIR* dp,			/* Pointer to the directory to open the file in */
+	FIL* fp,			/* Pointer to the blank file object */
+	const TCHAR* name,	/* Pointer to a single path component (no separators) */
+	BYTE mode,			/* Access mode and open mode flags */
+	BYTE opt			/* Option flags (FF_OPEN_NO_LOOKUP), or 0 */
+)
+{
+	FRESULT res;
+	DIR dj;
+	FATFS *fs;
+	DEF_NAMEBUFF
+
+
+	if (!fp || !name) return FR_INVALID_OBJECT;
+
+	res = validate(&dp->obj, &fs);	/* Check validity of the directory object, and take the volume grant */
+	if (res == FR_OK) {
+		mode &= FF_FS_READONLY ? FA_READ : FA_READ | FA_WRITE | FA_CREATE_ALWAYS | FA_CREATE_NEW | FA_OPEN_ALWAYS | FA_OPEN_APPEND;
+#if !FF_FS_READONLY
+		/* Skipping the lookup only makes sense when creating, and it makes
+		/  FA_OPEN_ALWAYS/FA_CREATE_NEW behave as FA_CREATE_ALWAYS, as nothing is
+		/  left to detect an existing entry with. */
+		if ((opt & FF_OPEN_NO_LOOKUP) && !(mode & (FA_CREATE_ALWAYS | FA_CREATE_NEW | FA_OPEN_ALWAYS))) {
+			res = FR_INVALID_PARAMETER;
+		}
+#else
+		if (opt & FF_OPEN_NO_LOOKUP) res = FR_INVALID_PARAMETER;
+#endif
+		if (res == FR_OK) {
+			dj.obj = dp->obj;		/* Look the name up in this directory, not from the volume root */
+			INIT_NAMEBUFF(fs);
+			res = create_name(&dj, &name);	/* Build the lookup pattern from the single component */
+			if (res == FR_OK) {
+				if (*name >= ' ') {	/* create_name() stopped at a separator: not a single component */
+					res = FR_INVALID_NAME;
+				} else {
+					/* FR_NO_FILE without scanning: open_from_dir() then goes straight to
+					/  dir_register(). If the name IS present this registers a second entry
+					/  for it, so the caller owns that guarantee. */
+					res = (opt & FF_OPEN_NO_LOOKUP) ? FR_NO_FILE : dir_find(&dj);
+					res = open_from_dir(&dj, fp, mode, res);
+				}
+			}
+			FREE_NAMEBUFF();
+		}
 	}
 
 	if (res != FR_OK) fp->obj.fs = 0;	/* Invalidate file object on error */
