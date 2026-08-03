@@ -1831,9 +1831,17 @@ static FRESULT dir_alloc (	/* FR_OK(0):succeeded, !=0:error */
 	FRESULT res;
 	UINT n;
 	FATFS *fs = dp->obj.fs;
+#if FF_DIR_ALLOC_HINT
+	/* LOCAL PATCH (libdragon): resume from the last successful allocation in this
+	/  directory, so a run of creates does not rescan from the top every time. If
+	/  nothing is found from there, retry from the top before giving up. */
+	DWORD start = (fs->last_dir_ofs != 0 && dp->obj.sclust == fs->last_dir_scl) ? fs->last_dir_ofs : 0;
 
-
+retry:
+	res = dir_sdi(dp, start);
+#else
 	res = dir_sdi(dp, 0);
+#endif
 	if (res == FR_OK) {
 		n = 0;
 		do {
@@ -1852,6 +1860,16 @@ static FRESULT dir_alloc (	/* FR_OK(0):succeeded, !=0:error */
 		} while (res == FR_OK);
 	}
 
+#if FF_DIR_ALLOC_HINT
+	if (res != FR_OK && start != 0) {	/* Nothing usable above the hint: rescan from the top */
+		start = 0;
+		goto retry;
+	}
+	if (res == FR_OK) {			/* Resume past this block on the next allocation */
+		fs->last_dir_scl = dp->obj.sclust;
+		fs->last_dir_ofs = dp->dptr + SZDIRE;
+	}
+#endif
 	if (res == FR_NO_FILE) res = FR_DENIED;	/* No directory entry to allocate */
 	return res;
 }
@@ -2613,6 +2631,11 @@ static FRESULT dir_remove (	/* FR_OK:Succeeded, FR_DISK_ERR:A disk error */
 {
 	FRESULT res;
 	FATFS *fs = dp->obj.fs;
+#if FF_DIR_ALLOC_HINT
+	/* LOCAL PATCH (libdragon): this frees entries below the resume point, so drop
+	/  the hint to keep them reusable (see FF_DIR_ALLOC_HINT). */
+	if (dp->obj.sclust == fs->last_dir_scl) fs->last_dir_ofs = 0;
+#endif
 #if FF_USE_LFN		/* LFN configuration */
 	DWORD last = dp->dptr;
 
@@ -3580,6 +3603,9 @@ static FRESULT mount_volume (	/* FR_OK(0): successful, !=0: an error occurred */
 		}
 #if !FF_FS_READONLY
 		fs->last_clst = fs->free_clst = 0xFFFFFFFF;		/* Invalidate cluster allocation information */
+#if FF_DIR_ALLOC_HINT
+		fs->last_dir_scl = fs->last_dir_ofs = 0;		/* LOCAL PATCH (libdragon): no dir_alloc() resume point yet */
+#endif
 		fs->fsi_flag = 0;	/* Enable to sync PercInUse value in VBR */
 #endif
 		fmt = FS_EXFAT;			/* FAT sub-type */
@@ -3645,6 +3671,9 @@ static FRESULT mount_volume (	/* FR_OK(0): successful, !=0: an error occurred */
 #if !FF_FS_READONLY
 		/* Get FSInfo if available */
 		fs->last_clst = fs->free_clst = 0xFFFFFFFF;		/* Invalidate cluster allocation information */
+#if FF_DIR_ALLOC_HINT
+		fs->last_dir_scl = fs->last_dir_ofs = 0;		/* LOCAL PATCH (libdragon): no dir_alloc() resume point yet */
+#endif
 		fs->fsi_flag = 0x80;	/* Disable FSInfo by default */
 		if (fmt == FS_FAT32
 			&& ld_16(fs->win + BPB_FSInfo32) == 1	/* FAT32: Enable FSInfo feature only if FSInfo sector is next to VBR */

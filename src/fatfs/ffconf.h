@@ -315,6 +315,22 @@
 */
 
 
+#define FF_DIR_ALLOC_HINT			1
+/* FF_DIR_ALLOC_HINT remembers where the last directory entry allocation succeeded,
+/  and resumes the free-slot search from there instead of rewinding to the top of
+/  the directory. dir_alloc() otherwise rescans the whole directory on every create,
+/  which is O(entries) per file: creating N files in one directory costs O(N^2)
+/  single-sector reads. This is the same idea as fs->last_clst for clusters.
+/
+/  One hint is kept per volume, so it helps a run of creates in a single directory
+/  (the common case) and costs nothing otherwise. Deleting an entry invalidates it,
+/  so freed slots are still reused rather than leaked.
+/
+/  0: Always search from the top of the directory (stock FatFs behavior).
+/  1: Resume from the last successful allocation.
+*/
+
+
 /*--- End of configuration options ---*/
 
 #endif /* FFCONF_H */

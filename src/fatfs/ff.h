@@ -166,6 +166,11 @@ typedef struct {
 #if !FF_FS_READONLY
 	DWORD	last_clst;	/* Last allocated cluster (invalid if >=n_fatent) */
 	DWORD	free_clst;	/* Number of free clusters (invalid if >=fs->n_fatent-2) */
+#if FF_DIR_ALLOC_HINT
+	/* LOCAL PATCH (libdragon): resume point for dir_alloc(), see FF_DIR_ALLOC_HINT */
+	DWORD	last_dir_scl;	/* Start cluster of the directory last_dir_ofs refers to */
+	DWORD	last_dir_ofs;	/* Offset to resume the free entry search from (0:no hint) */
+#endif
 #endif
 #if FF_FS_RPATH
 	DWORD	cdir;		/* Current directory start cluster (0:root) */
