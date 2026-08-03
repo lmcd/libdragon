@@ -29,6 +29,13 @@ static filesystem_t *fat_filesystems[FF_VOLUMES] = {0};
  * FatFs (TINY) uses disk_read(..., 1) for metadata via move_window, and
  * multi-sector I/O for aligned file data. Caching only count==1 accesses
  * keeps hot FAT/dir sectors across bulk file reads/writes.
+ *
+ * The cache is write-back: single-sector writes are held in a dirty slot
+ * instead of going to the disk, because a bulk file write rewrites the same
+ * handful of FAT/dir sectors repeatedly and each physical write costs ~2ms on
+ * SD. Dirty slots reach the disk on eviction, on CTRL_SYNC (which FatFs issues
+ * from f_sync/f_close), and on fat_unmount. Data written between syncs is
+ * therefore lost if the console resets, exactly as for any write-back cache.
  *********************************************************************/
 
 _Static_assert(FF_MIN_SS == 512 && FF_MAX_SS == 512, "sector cache assumes 512-byte sectors");
@@ -37,6 +44,7 @@ _Static_assert(FF_MIN_SS == 512 && FF_MAX_SS == 512, "sector cache assumes 512-b
 
 typedef struct {
 	bool     valid;
+	bool     dirty;
 	LBA_t    sector;
 	uint32_t tick;
 	uint8_t  data[512];
@@ -44,6 +52,7 @@ typedef struct {
 
 typedef struct {
 	uint32_t tick;
+	BYTE     pdrv;
 	fat_sector_cache_slot_t slots[FAT_SECTOR_CACHE_SIZE];
 } fat_sector_cache_t;
 
@@ -59,28 +68,76 @@ static fat_sector_cache_slot_t *__fat_cache_lookup(fat_sector_cache_t *cache, LB
 	return NULL;
 }
 
+/** @brief Write a dirty slot back to the disk. Returns false on disk error. */
+static bool __fat_cache_flush_slot(fat_sector_cache_t *cache, fat_sector_cache_slot_t *slot)
+{
+	if (!slot->valid || !slot->dirty)
+		return true;
+	if (!fat_disks[cache->pdrv].disk_write)
+		return false;
+	if (fat_disks[cache->pdrv].disk_write(slot->data, slot->sector, 1) != RES_OK)
+		return false;
+	slot->dirty = false;
+	return true;
+}
+
+/** @brief Write back all dirty slots. Returns false if any write failed. */
+static bool __fat_cache_flush(fat_sector_cache_t *cache)
+{
+	bool ok = true;
+	for (int i = 0; i < FAT_SECTOR_CACHE_SIZE; i++)
+		ok = __fat_cache_flush_slot(cache, &cache->slots[i]) && ok;
+	return ok;
+}
+
+/** @brief Write back dirty slots within a sector range. Returns false on disk error. */
+static bool __fat_cache_flush_range(fat_sector_cache_t *cache, LBA_t sector, UINT count)
+{
+	LBA_t end = sector + count;
+	bool ok = true;
+	for (int i = 0; i < FAT_SECTOR_CACHE_SIZE; i++) {
+		fat_sector_cache_slot_t *slot = &cache->slots[i];
+		if (slot->valid && slot->dirty && slot->sector >= sector && slot->sector < end)
+			ok = __fat_cache_flush_slot(cache, slot) && ok;
+	}
+	return ok;
+}
+
 static fat_sector_cache_slot_t *__fat_cache_evict(fat_sector_cache_t *cache)
 {
 	fat_sector_cache_slot_t *victim = NULL;
 	for (int i = 0; i < FAT_SECTOR_CACHE_SIZE; i++) {
 		fat_sector_cache_slot_t *slot = &cache->slots[i];
-		if (!slot->valid)
+		if (!slot->valid) {
+			/* An invalid slot is reused without a write-back, so it must never
+			   hold a pending write: everything clearing 'valid' clears 'dirty'. */
+			assertf(!slot->dirty, "FAT sector cache: invalid slot is dirty");
 			return slot;
+		}
 		if (!victim || slot->tick < victim->tick)
 			victim = slot;
 	}
+	/* The victim may hold data not yet on disk: write it back before reuse.
+	   On failure we must not drop it, so keep it and fail the caller. */
+	if (!__fat_cache_flush_slot(cache, victim))
+		return NULL;
 	return victim;
 }
 
-static void __fat_cache_store(fat_sector_cache_t *cache, LBA_t sector, const uint8_t *data)
+static bool __fat_cache_store(fat_sector_cache_t *cache, LBA_t sector, const uint8_t *data, bool dirty)
 {
 	fat_sector_cache_slot_t *slot = __fat_cache_lookup(cache, sector);
-	if (!slot)
+	if (!slot) {
 		slot = __fat_cache_evict(cache);
+		if (!slot)
+			return false;
+	}
 	slot->valid = true;
+	slot->dirty = slot->dirty || dirty;
 	slot->sector = sector;
 	slot->tick = ++cache->tick;
 	memcpy(slot->data, data, 512);
+	return true;
 }
 
 static void __fat_cache_invalidate_range(fat_sector_cache_t *cache, LBA_t sector, UINT count)
@@ -88,8 +145,12 @@ static void __fat_cache_invalidate_range(fat_sector_cache_t *cache, LBA_t sector
 	LBA_t end = sector + count;
 	for (int i = 0; i < FAT_SECTOR_CACHE_SIZE; i++) {
 		fat_sector_cache_slot_t *slot = &cache->slots[i];
-		if (slot->valid && slot->sector >= sector && slot->sector < end)
+		if (slot->valid && slot->sector >= sector && slot->sector < end) {
+			/* A bulk write just superseded this sector on disk, so any pending
+			   write-back is stale and must be dropped rather than flushed. */
 			slot->valid = false;
+			slot->dirty = false;
+		}
 	}
 }
 
@@ -125,9 +186,14 @@ DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
 		}
 		DRESULT res = fat_disks[pdrv].disk_read(buff, sector, count);
 		if (res == RES_OK)
-			__fat_cache_store(cache, sector, buff);
+			__fat_cache_store(cache, sector, buff, false);
 		return res;
 	}
+
+	/* This read does not consult the cache, so any sector still held dirty must
+	   reach the disk first, or the caller would get pre-write contents. */
+	if (cache && !__fat_cache_flush_range(cache, sector, count))
+		return RES_ERROR;
 
 	return fat_disks[pdrv].disk_read(buff, sector, count);
 }
@@ -138,17 +204,25 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
 	if (!fat_disks[pdrv].disk_write)
 		return RES_PARERR;
 
+	fat_sector_cache_t *cache = fat_sector_caches[pdrv];
+
+	/* Single-sector writes are FAT/dir metadata, and the same few sectors get
+	   rewritten over and over during a bulk file write. Keep them in the cache
+	   and defer the physical write until eviction or CTRL_SYNC.
+	   The RDRAM check matches disk_read(): caching copies through the CPU, so it
+	   must not be attempted for a buffer in cartridge space. A userland write of
+	   exactly one sector reaches here with the caller's own buffer. */
+	if (cache && count == 1 && PhysicalAddr(buff) < 0x00800000) {
+		if (__fat_cache_store(cache, sector, buff, true))
+			return RES_OK;
+		return RES_ERROR;
+	}
+
 	DRESULT res = fat_disks[pdrv].disk_write(buff, sector, count);
 	if (res != RES_OK)
 		return res;
 
-	fat_sector_cache_t *cache = fat_sector_caches[pdrv];
-	if (!cache)
-		return res;
-
-	if (count == 1)
-		__fat_cache_store(cache, sector, buff);
-	else
+	if (cache)
 		__fat_cache_invalidate_range(cache, sector, count);
 	return res;
 }
@@ -156,6 +230,16 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
 /** @brief FatFS disk API: implementation by forwarding to a disk-specific function. */
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
 {
+	/* CTRL_SYNC must leave nothing pending: write back deferred metadata first. */
+	if (cmd == CTRL_SYNC && fat_sector_caches[pdrv]) {
+		if (!__fat_cache_flush(fat_sector_caches[pdrv]))
+			return RES_ERROR;
+		/* A disk with no ioctl has nothing further to flush, so the sync is done;
+		   reporting RES_PARERR here would fail f_sync() after a successful flush. */
+		if (!fat_disks[pdrv].disk_ioctl)
+			return RES_OK;
+	}
+
 	if (fat_disks[pdrv].disk_ioctl)
 		return fat_disks[pdrv].disk_ioctl(cmd, buff);
 	return RES_PARERR;
@@ -552,6 +636,7 @@ int fat_mount(const char *prefix, const fat_disk_t* disk, int flags)
 
     fat_sector_cache_t *cache = calloc(1, sizeof(fat_sector_cache_t));
 	assertf(cache, "Out of memory");
+    cache->pdrv = vol_id;
     fat_sector_caches[vol_id] = cache;
 
     FATFS *fatfs = malloc(sizeof(FATFS));
@@ -605,6 +690,12 @@ int fat_unmount(int vol_id)
         return -1;
     }
 
+    /* f_mount(NULL) does not sync, so write back deferred metadata now, while the
+       disk is still live and before the cache is freed below. */
+    int flush_errno = 0;
+    if (fat_sector_caches[vol_id] && !__fat_cache_flush(fat_sector_caches[vol_id]))
+        flush_errno = EIO;
+
     char path[3] = {'0' + vol_id, ':', 0};
     FRESULT err = f_mount(NULL, path, 0);
     if (err != FR_OK) {
@@ -615,6 +706,7 @@ int fat_unmount(int vol_id)
     int detach_errno = 0;
     if (fat_filesystems[vol_id] && detach_filesystem_by_pointer(fat_filesystems[vol_id]) < 0)
         detach_errno = errno;
+    if (!detach_errno) detach_errno = flush_errno;	/* Do not lose a flush failure */
 
     free(fat_filesystems[vol_id]);
     fat_filesystems[vol_id] = NULL;
