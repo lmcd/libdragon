@@ -4120,6 +4120,56 @@ FRESULT f_open_in_dir (
 
 
 /*-----------------------------------------------------------------------*/
+/* API: Open a File from a Locator                                       */
+/*-----------------------------------------------------------------------*/
+
+/* LOCAL PATCH (libdragon): open a file straight from a locator captured by
+/  f_readdir_obj(), with no path resolution and no directory access -- the whole
+/  open costs no disk I/O at all. Intended for enumerating a directory once and
+/  then opening the entries found.
+/
+/  Read-only. A locator records where the file's *data* is, not where its
+/  directory entry lives, so fp->dir_sect/dir_ptr cannot be set; f_sync() would
+/  then pull sector 0 into the window and write through a NULL dir_ptr. Write
+/  modes are rejected rather than silently downgraded.
+/
+/  The locator is invalidated by unmounting (validate() rejects a stale mount ID),
+/  but not by the file being deleted or truncated through another path -- the
+/  caller owns that, exactly as for a FIL held open across such changes. */
+
+FRESULT f_open_obj (
+	FIL* fp,			/* Pointer to the blank file object */
+	const FFOBJID* obj,	/* Locator filled in by f_readdir_obj() */
+	BYTE mode			/* Access mode (FA_READ, or 0 for the same) */
+)
+{
+	FRESULT res;
+	FATFS *fs;
+
+
+	if (!fp || !obj) return FR_INVALID_OBJECT;	/* Reject null pointers */
+	if (mode & (BYTE)~FA_READ) return FR_INVALID_PARAMETER;	/* Read-only, see above */
+
+	res = validate((FFOBJID*)obj, &fs);	/* Check the locator still refers to this mount */
+	if (res == FR_OK && (obj->attr & AM_DIR)) res = FR_NO_FILE;	/* Not a regular file */
+	if (res == FR_OK) {
+		memset(fp, 0, sizeof *fp);	/* err/fptr/clust/sect/cltbl/dir_sect/dir_ptr all zero */
+		fp->obj = *obj;
+#if FF_FS_LOCK
+		fp->obj.lockid = 0;	/* File sharing is not tracked by this entry point */
+#endif
+		fp->flag = mode | FA_READ;
+	} else {
+		fp->obj.fs = 0;			/* Invalidate file object on error */
+	}
+
+	LEAVE_FF(fs, res);
+}
+
+
+
+
+/*-----------------------------------------------------------------------*/
 /* API: Read File                                                        */
 /*-----------------------------------------------------------------------*/
 
@@ -4997,9 +5047,20 @@ FRESULT f_closedir (
 /* API: Read Directory Entries in Sequence                               */
 /*-----------------------------------------------------------------------*/
 
-FRESULT f_readdir (
+/* LOCAL PATCH (libdragon): f_readdir() that also captures a locator for the entry
+/  just read, so it can later be opened by f_open_obj() with no directory access at
+/  all. This has to be done here rather than by the caller: the data comes from
+/  dp->dir and, on exFAT, fs->dirbuf, and both only describe this entry between
+/  DIR_READ_FILE() and the dir_next() that advances past it.
+/
+/  `obj` may be 0, in which case this behaves exactly as f_readdir(). It is left
+/  invalidated (obj->fs == 0) at end of directory and on any error, so a locator
+/  that was never filled cannot be mistaken for a usable one. */
+
+FRESULT f_readdir_obj (
 	DIR* dp,			/* Pointer to the open directory object */
-	FILINFO* fno		/* Pointer to file information to return */
+	FILINFO* fno,		/* Pointer to file information to return */
+	FFOBJID* obj		/* Pointer to the locator to fill, or 0 */
 )
 {
 	FRESULT res;
@@ -5007,6 +5068,7 @@ FRESULT f_readdir (
 	DEF_NAMEBUFF
 
 
+	if (obj) obj->fs = 0;			/* Invalid until an entry is actually read */
 	res = validate(&dp->obj, &fs);	/* Check validity of the directory object */
 	if (res == FR_OK) {
 		if (!fno) {
@@ -5018,6 +5080,26 @@ FRESULT f_readdir (
 			if (res == FR_NO_FILE) res = FR_OK;	/* Ignore end of directory */
 			if (res == FR_OK) {				/* A valid entry is found */
 				get_fileinfo(dp, fno);		/* Get the object information */
+				/* dp->sect == 0 means the read pointer reached end of directory and
+				/  get_fileinfo() returned without filling anything in. */
+				if (obj && dp->sect != 0) {
+					obj->fs = fs;
+					obj->id = fs->id;
+					obj->attr = fno->fattrib;
+#if FF_FS_LOCK
+					obj->lockid = 0;	/* Not an open file: no share registered */
+#endif
+#if FF_FS_EXFAT
+					if (fs->fs_type == FS_EXFAT) {
+						init_alloc_info(obj, dp);	/* Reads fs->dirbuf and dp->blk_ofs */
+					} else
+#endif
+					{
+						obj->sclust = ld_clust(fs, dp->dir);
+						obj->objsize = ld_32(dp->dir + DIR_FileSize);
+						obj->stat = 0;
+					}
+				}
 				res = dir_next(dp, 0);		/* Increment index for next */
 				if (res == FR_NO_FILE) res = FR_OK;	/* Ignore end of directory now */
 			}
@@ -5026,7 +5108,17 @@ FRESULT f_readdir (
 	}
 
 	if (fno && res != FR_OK) fno->fname[0] = 0;	/* Clear the file information if any error occured */
+	if (obj && res != FR_OK) obj->fs = 0;		/* Never hand back a locator from a failed read */
 	LEAVE_FF(fs, res);
+}
+
+
+FRESULT f_readdir (
+	DIR* dp,			/* Pointer to the open directory object */
+	FILINFO* fno		/* Pointer to file information to return */
+)
+{
+	return f_readdir_obj(dp, fno, 0);	/* LOCAL PATCH (libdragon): shared implementation */
 }
 
 
